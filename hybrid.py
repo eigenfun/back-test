@@ -349,6 +349,35 @@ class HybridPutCallStrategy:
         else:
             print("No split adjustment needed")
     
+    def _get_expiry_stock_price(self, expiry_date: str) -> Optional[float]:
+        """Get stock price on expiration date with fallback to nearest available date"""
+        if not expiry_date:
+            return None
+            
+        # First try exact match
+        if expiry_date in self.stock_prices:
+            return self.stock_prices[expiry_date]
+        
+        # Try to find the closest date (within ±3 business days)
+        import datetime
+        try:
+            target_date = datetime.datetime.strptime(expiry_date, '%Y-%m-%d')
+        except ValueError:
+            return None
+            
+        # Look for nearby dates
+        for days_offset in range(1, 4):  # Check ±1-3 days
+            # Try earlier dates first (market closed on expiry might have price from previous day)
+            for direction in [-1, 1]:
+                check_date = target_date + datetime.timedelta(days=direction * days_offset)
+                check_date_str = check_date.strftime('%Y-%m-%d')
+                if check_date_str in self.stock_prices:
+                    print(f"  Warning: Using stock price from {check_date_str} for expiry {expiry_date}")
+                    return self.stock_prices[check_date_str]
+        
+        print(f"  Warning: No stock price found for expiry date {expiry_date} or nearby dates")
+        return None
+    
     def get_spot_price(self, date: str) -> float:
         """Get spot price from daily adjusted stock data, fallback to options estimation"""
         # First try to get actual adjusted close price
@@ -475,10 +504,16 @@ class HybridPutCallStrategy:
         print("-" * 60)
         
         # Get all Fridays in the period
+        print(f"Finding trading Fridays between {start_date} and {end_date}...")
         fridays = self.get_trading_fridays(start_date, end_date)
         
         if not fridays:
             raise ValueError("No trading days found with options data")
+        
+        print(f"Found {len(fridays)} trading Fridays to process: {fridays[0]} to {fridays[-1]}")
+        print(f"Processing weekly strategy execution...")
+        
+        last_friday = None
         
         for friday in fridays:
             spot_price = self.get_spot_price(friday)
@@ -491,46 +526,103 @@ class HybridPutCallStrategy:
             week_start_total = week_start_capital + week_start_stock_value
                 
             print(f"\n{friday} (Friday) - {self.symbol} @ ${spot_price:.2f} [{self.strategy_mode} mode]")
+            print(f"  Week {fridays.index(friday) + 1} of {len(fridays)} | Capital: ${week_start_capital:,.0f} | Stock Shares: {self.stock_shares} | Active Positions: {len(self.positions)}")
             
-            # Handle expiring positions (positions expiring today)
-            expiring_positions = [pos for pos in self.positions 
-                                if pos['expiry'] == friday]
+            # Find positions that expired since last processing date (or today if expiry == today)
+            current_date = datetime.strptime(friday, '%Y-%m-%d')
+            if last_friday:
+                last_date = datetime.strptime(last_friday, '%Y-%m-%d')
+                # Check for positions that expired between last_friday (exclusive) and current friday (inclusive)
+                expiring_positions = [pos for pos in self.positions 
+                                    if last_date < datetime.strptime(pos['expiry'], '%Y-%m-%d') <= current_date]
+                print(f"  Checking for positions that expired between {last_friday} and {friday}...")
+            else:
+                # First processing date - only check positions expiring today
+                expiring_positions = [pos for pos in self.positions 
+                                    if pos['expiry'] == friday]
+                print(f"  First week - checking positions expiring on {friday}...")
+            
+            if expiring_positions:
+                print(f"  Found {len(expiring_positions)} expiring position(s)")
+            else:
+                print(f"  No positions expiring this period")
+            
+            # Store closing data for expired positions before removing them
+            expired_positions_data = []
             
             for pos in expiring_positions:
-                if pos['type'] == 'PUT':
-                    # Cash secured put expiring
-                    if spot_price > pos['strike']:
-                        print(f"  PUT {pos['strike']}P expires worthless (profit)")
-                        # Remove position without cost
-                        self.positions = [p for p in self.positions if not 
-                                        (p['strike'] == pos['strike'] and p['expiry'] == pos['expiry'] and p['type'] == pos['type'])]
-                    else:
-                        # Put assigned - buy stock at strike price
-                        shares_assigned = pos['quantity'] * 100
-                        self.buy_stock(friday, pos['strike'], shares_assigned)
-                        # Remove position
-                        self.positions = [p for p in self.positions if not 
-                                        (p['strike'] == pos['strike'] and p['expiry'] == pos['expiry'] and p['type'] == pos['type'])]
+                # Get the actual stock price on the expiration date
+                expiry_stock_price = self._get_expiry_stock_price(pos['expiry'])
+                if expiry_stock_price is None:
+                    print(f"  Warning: No expiry price found for {pos['expiry']}, using current spot price as fallback")
+                    expiry_stock_price = spot_price
                 
-                elif pos['type'] == 'CALL':
-                    # Covered call expiring
-                    if spot_price <= pos['strike']:
-                        print(f"  CALL {pos['strike']}C expires worthless (profit)")
-                        # Remove position without cost
-                        self.positions = [p for p in self.positions if not 
-                                        (p['strike'] == pos['strike'] and p['expiry'] == pos['expiry'] and p['type'] == pos['type'])]
-                    else:
-                        # Call assigned - stock called away
-                        shares_called = pos['quantity'] * 100
-                        if shares_called <= self.stock_shares:
-                            self.sell_stock(friday, pos['strike'], shares_called)
-                        # Remove position
-                        self.positions = [p for p in self.positions if not 
-                                        (p['strike'] == pos['strike'] and p['expiry'] == pos['expiry'] and p['type'] == pos['type'])]
+                # Calculate the intrinsic value at expiration
+                if pos['type'] == 'PUT':
+                    closing_price = max(0, pos['strike'] - expiry_stock_price)
+                else:  # CALL
+                    closing_price = max(0, expiry_stock_price - pos['strike'])
+                    
+                # P&L = entry_price - closing_price (since we sold the option)
+                position_pnl = (pos['entry_price'] - closing_price) * pos['quantity'] * 100
+                
+                # Store the closing data for later display
+                expired_positions_data.append({
+                    'position': pos,
+                    'closing_price': closing_price,
+                    'position_pnl': position_pnl,
+                    'expiry_stock_price': expiry_stock_price
+                })
+
+            # Process each expired position based on P&L
+            for exp_data in expired_positions_data:
+                pos = exp_data['position']
+                closing_price = exp_data['closing_price']
+                position_pnl = exp_data['position_pnl']
+                expiry_stock_price = exp_data['expiry_stock_price']
+                
+                if position_pnl >= 0:
+                    # Position is profitable or breakeven - let it expire
+                    if pos['type'] == 'PUT':
+                        if expiry_stock_price > pos['strike']:
+                            print(f"  PUT {pos['strike']}P expires worthless (profit: ${position_pnl:.0f})")
+                        else:
+                            print(f"  PUT {pos['strike']}P expires ITM but profitable (P&L: ${position_pnl:.0f})")
+                            # Still allow assignment and switch to calls
+                            shares_assigned = pos['quantity'] * 100
+                            self.buy_stock(friday, pos['strike'], shares_assigned)
+                            self.strategy_mode = "CALL"  # Switch to selling covered calls
+                            print(f"    Assigned {shares_assigned} shares, switching to CALL mode")
+                    else:  # CALL
+                        if expiry_stock_price <= pos['strike']:
+                            print(f"  CALL {pos['strike']}C expires worthless (profit: ${position_pnl:.0f})")
+                        else:
+                            print(f"  CALL {pos['strike']}C expires ITM but profitable (P&L: ${position_pnl:.0f})")
+                            # Stock called away but we keep the profit
+                            shares_called = pos['quantity'] * 100
+                            if shares_called <= self.stock_shares:
+                                self.sell_stock(friday, pos['strike'], shares_called)
+                                print(f"    Stock called away at ${pos['strike']:.2f}")
+                                if self.stock_shares < 100:
+                                    self.strategy_mode = "PUT"  # Switch back to puts if no stock
+                                    print(f"    No stock left, switching to PUT mode")
+                else:
+                    # Position has negative P&L - close it to avoid further losses
+                    close_cost = closing_price * pos['quantity'] * 100
+                    self.current_capital -= close_cost
+                    
+                    print(f"  {pos['type']} {pos['strike']}{pos['type'][0]} closed at ${closing_price:.2f} (loss: ${-position_pnl:.0f})")
+                
+                # Remove the position regardless of outcome
+                self.positions = [p for p in self.positions if not 
+                                (p['strike'] == pos['strike'] and p['expiry'] == pos['expiry'] and p['type'] == pos['type'])]
             
             # Roll existing positions (close current, open new)
             positions_to_roll = [pos for pos in self.positions 
                                if pos['expiry'] not in [friday]]  # Not expiring today
+            
+            if positions_to_roll:
+                print(f"  Rolling {len(positions_to_roll)} existing position(s)...")
             
             for pos in positions_to_roll:
                 # Close current position
@@ -555,6 +647,7 @@ class HybridPutCallStrategy:
             
             # Open new weekly position based on current mode
             next_friday = self.find_next_friday_expiry(friday)
+            print(f"  Looking for new {self.strategy_mode} options expiring {next_friday}...")
             if next_friday:
                 df = self.options_data[friday]
                 
@@ -568,10 +661,13 @@ class HybridPutCallStrategy:
                         max_contracts = int(self.current_capital / capital_per_contract)
                         
                         if max_contracts > 0:
+                            print(f"  Selected ${selected_option['strike']:.2f}P (delta: {selected_option['delta']:.2f}) for {max_contracts} contracts")
                             self.execute_trade(friday, 'sell_open', 'PUT', selected_option['strike'],
                                              selected_option['bid'], next_friday, max_contracts, selected_option.get('source_line'))
                         else:
                             print(f"  Insufficient capital for put (need ${capital_per_contract:.0f})")
+                    else:
+                        print(f"  No suitable put options found for target delta {self.target_delta}")
                 
                 elif self.strategy_mode == "CALL" and self.stock_shares >= 100:
                     # Sell covered call
@@ -581,8 +677,17 @@ class HybridPutCallStrategy:
                         # Calculate maximum contracts based on stock holdings
                         max_contracts = self.stock_shares // 100  # 1 contract per 100 shares
                         if max_contracts > 0:
+                            print(f"  Selected ${selected_option['strike']:.2f}C (delta: {selected_option['delta']:.2f}) for {max_contracts} contracts")
                             self.execute_trade(friday, 'sell_open', 'CALL', selected_option['strike'],
                                              selected_option['bid'], next_friday, max_contracts, selected_option.get('source_line'))
+                        else:
+                            print(f"  No stock available to cover calls")
+                    else:
+                        print(f"  No suitable call options found for target delta {self.target_delta}")
+                elif self.strategy_mode == "CALL" and self.stock_shares < 100:
+                    print(f"  Cannot sell calls - insufficient stock (have {self.stock_shares}, need 100+)")
+            else:
+                print(f"  No expiry date found for new options")
             
             # Calculate weekly P&L and summary
             week_end_capital = self.current_capital
@@ -639,84 +744,83 @@ class HybridPutCallStrategy:
                     source_info = f"{base_filename}:{open_line}"
                     week_source_info.append(source_info)
             
-            # Check if positions expired this week (before they were removed from self.positions)
+            # For positions that expired this week, show their opening price as spot and expiry price as exp
+            position_open_price = spot_price  # Default to current Friday price
+            expiry_date = None
+            expiry_price = None
+            
             if expiring_positions:
                 # Use the expiry date from expiring positions
                 first_expiring_pos = expiring_positions[0]
                 expiry_date = first_expiring_pos['expiry']
-                if expiry_date in self.stock_prices:
-                    expiry_price = self.stock_prices[expiry_date]
-            elif week_positions:
-                # Use the expiry date from the first position to get stock closing price
-                first_pos_expiry = week_positions[0]['expiry']
-                if first_pos_expiry:
-                    expiry_date = first_pos_expiry
-                    if first_pos_expiry in self.stock_prices:
-                        expiry_price = self.stock_prices[first_pos_expiry]
-            
-            # Add ALL expired positions (regardless of when they were opened)
-            for pos in expiring_positions:
-                week_positions.append(pos)
+                # Get the actual stock closing price on the expiration date
+                expiry_price = self._get_expiry_stock_price(expiry_date)
                 
-            if week_positions:
-                # Calculate option P&L for positions opened this week
-                for pos in week_positions:
-                    if pos.get('entry_date') == friday and pos['expiry'] in self.options_data:
-                        # Get option closing price at expiration
-                        expiry_df = self.options_data[pos['expiry']]
-                        
-                        # Find the same option at expiration
-                        option_type = pos.get('type', 'PUT')  # Default to PUT for older position tracking
-                        if option_type == 'PUT':
-                            if 'type' in expiry_df.columns:
-                                closing_options = expiry_df[(expiry_df['strike'] == pos['strike']) & (expiry_df['type'].str.upper() == 'PUT')]
-                            else:
-                                closing_options = expiry_df[(expiry_df['strike'] == pos['strike']) & 
-                                                           (expiry_df.get('contractid', expiry_df.get('contractID', '')).str.contains('P', na=False))]
-                        else:  # CALL
-                            if 'type' in expiry_df.columns:
-                                closing_options = expiry_df[(expiry_df['strike'] == pos['strike']) & (expiry_df['type'].str.upper() == 'CALL')]
-                            else:
-                                closing_options = expiry_df[(expiry_df['strike'] == pos['strike']) & 
-                                                           (expiry_df.get('contractid', expiry_df.get('contractID', '')).str.contains('C', na=False))]
-                        
-                        if not closing_options.empty:
-                            # At expiration, options are worth exactly their intrinsic value
-                            if pos['expiry'] in self.stock_prices:
-                                stock_price_at_expiry = self.stock_prices[pos['expiry']]
-                                if option_type == 'PUT':
-                                    closing_price = max(0, pos['strike'] - stock_price_at_expiry)
-                                else:  # CALL
-                                    closing_price = max(0, stock_price_at_expiry - pos['strike'])
-                            else:
-                                # Fallback to market price if no stock data
-                                closing_price = (closing_options.iloc[0]['bid'] + closing_options.iloc[0]['ask']) / 2
-                            
-                            option_closing_prices.append(f"${closing_price:.2f}")
-                            # P&L = entry_price - closing_price (since we sold the option)
-                            option_pnl = (pos['entry_price'] - closing_price) * pos['quantity'] * 100
-                            weekly_option_pnl += option_pnl
-                            
-                            # Track source info: opening line + closing line
-                            open_line = pos.get('source_line', 'unknown')
-                            close_line = closing_options.iloc[0].name + 2  # +2 for 0-based index and CSV header
-                            base_filename = self.data_sources.get(pos['expiry'], 'unknown')
-                            source_info = f"{base_filename}:{open_line}-{close_line}"
-                            week_source_info.append(source_info)
+                # Get the stock price from when this position was opened (for spot price)
+                open_date = first_expiring_pos.get('entry_date')
+                if open_date and open_date in self.stock_prices:
+                    position_open_price = self.stock_prices[open_date]
+            else:
+                # No positions expired this week - don't show expiry info
+                expiry_date = None
+                expiry_price = None
+            
+            # Calculate option closing prices using stored expired positions data
+            week_source_info = []  # Track source info for this week
+            
+            # Process expired positions for closing prices and P&L
+            for exp_data in expired_positions_data:
+                pos = exp_data['position']
+                closing_price = exp_data['closing_price']
+                position_pnl = exp_data['position_pnl']
+                
+                option_closing_prices.append(f"${closing_price:.2f}")
+                weekly_option_pnl += position_pnl
+                
+                # Track source info for expired positions
+                if pos['expiry'] in self.options_data:
+                    expiry_df = self.options_data[pos['expiry']]
+                    option_type = pos.get('type', 'PUT')
+                    
+                    if option_type == 'PUT':
+                        if 'type' in expiry_df.columns:
+                            closing_options = expiry_df[(expiry_df['strike'] == pos['strike']) & (expiry_df['type'].str.upper() == 'PUT')]
                         else:
-                            option_closing_prices.append("N/A")
-                            # Track source info even if no closing data found
-                            open_line = pos.get('source_line', 'unknown')
-                            base_filename = self.data_sources.get(pos['expiry'], 'unknown')
-                            source_info = f"{base_filename}:{open_line}-N/A"
-                            week_source_info.append(source_info)
+                            closing_options = expiry_df[(expiry_df['strike'] == pos['strike']) & 
+                                                       (expiry_df.get('contractid', expiry_df.get('contractID', '')).str.contains('P', na=False))]
+                    else:  # CALL
+                        if 'type' in expiry_df.columns:
+                            closing_options = expiry_df[(expiry_df['strike'] == pos['strike']) & (expiry_df['type'].str.upper() == 'CALL')]
+                        else:
+                            closing_options = expiry_df[(expiry_df['strike'] == pos['strike']) & 
+                                                       (expiry_df.get('contractid', expiry_df.get('contractID', '')).str.contains('C', na=False))]
+                    
+                    if not closing_options.empty:
+                        open_line = pos.get('source_line', 'unknown')
+                        close_line = closing_options.iloc[0].name + 2  # +2 for 0-based index and CSV header
+                        base_filename = self.data_sources.get(pos['expiry'], 'unknown')
+                        source_info = f"{base_filename}:{open_line}-{close_line}"
+                        week_source_info.append(source_info)
+                    else:
+                        open_line = pos.get('source_line', 'unknown')
+                        base_filename = self.data_sources.get(pos['expiry'], 'unknown')
+                        source_info = f"{base_filename}:{open_line}-N/A"
+                        week_source_info.append(source_info)
+            
+            # Add source info for current positions opened this week (opening line only)
+            for pos in self.positions:
+                if pos.get('entry_date') == friday:
+                    open_line = pos.get('source_line', 'unknown')
+                    base_filename = self.data_sources.get(friday, 'unknown')
+                    source_info = f"{base_filename}:{open_line}"
+                    week_source_info.append(source_info)
             
             option_close_str = ", ".join(option_closing_prices) if option_closing_prices else "N/A"
             
             # Weekly summary entry
             weekly_entry = {
                 'date': friday,
-                'spot_price': spot_price,
+                'spot_price': position_open_price,
                 'expiry_date': expiry_date,
                 'expiry_price': expiry_price,
                 'option_close_price': option_close_str,
@@ -727,15 +831,22 @@ class HybridPutCallStrategy:
                 'week_pnl': week_pnl,
                 'cumulative_pnl': week_end_total - self.initial_capital,
                 'total_value': week_end_total,
-                'cash_balance': week_end_capital,
                 'stock_value': week_end_stock_value,
                 'stock_shares': self.stock_shares,
                 'capital_allocated': total_capital_allocated,
                 'source': self._get_source_info(friday, week_source_info)
             }
             self.weekly_summary.append(weekly_entry)
+            
+            # Print week summary
+            print(f"  Week Summary: P&L ${week_pnl:,.0f} | Total Value: ${week_end_total:,.0f} | Stock: {self.stock_shares} shares | Mode: {self.strategy_mode} | Positions: {len(self.positions)}")
+            
+            # Update last_friday for next iteration
+            last_friday = friday
         
         # Calculate final performance
+        print(f"\nStrategy execution completed! Processed {len(fridays)} weeks.")
+        print(f"Final Mode: {self.strategy_mode} | Total Value: ${week_end_total:,.0f} | Stock Shares: {self.stock_shares} | Total Trades: {len(self.trades)}")
         return self.calculate_performance()
     
     def calculate_performance(self) -> Dict:
@@ -804,11 +915,11 @@ class HybridPutCallStrategy:
         if not self.weekly_summary:
             return
         
-        print("\n" + "="*255)
+        print("\n" + "="*245)
         print("WEEKLY POSITION AND P&L SUMMARY")
-        print("="*255)
-        print(f"{'Date':<12} {'Spot $':<8} {'Expiry':<12} {'Exp $':<8} {'Mode':<6} {'Positions':<25} {'Opt Close':<12} {'Opt P&L':<10} {'Week P&L':<10} {'Cum P&L':<10} {'Total Value':<12} {'Cash':<10} {'Capital Alloc':<13} {'Source':<40}")
-        print("-"*255)
+        print("="*245)
+        print(f"{'Date':<12} {'Spot $':<8} {'Expiry':<12} {'Exp $':<8} {'Mode':<6} {'Positions':<25} {'Opt Close':<12} {'Opt P&L':<10} {'Week P&L':<10} {'Cum P&L':<10} {'Total Value':<12} {'Capital Alloc':<13} {'Source':<40}")
+        print("-"*245)
         
         for entry in self.weekly_summary:
             expiry_date_str = f"{entry['expiry_date']:<12}" if entry['expiry_date'] else f"{'N/A':<12}"
@@ -825,11 +936,10 @@ class HybridPutCallStrategy:
                   f"${entry['week_pnl']:<9,.0f} "
                   f"${entry['cumulative_pnl']:<9,.0f} "
                   f"${entry['total_value']:<11,.0f} "
-                  f"${entry['cash_balance']:<9,.0f} "
                   f"${entry['capital_allocated']:<12,.0f} "
                   f"{entry['source'][:39]:<40}")
         
-        print("-"*255)
+        print("-"*245)
 
 def main():
     parser = argparse.ArgumentParser(description='Hybrid Put/Call Strategy Backtest')
