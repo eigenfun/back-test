@@ -2,3 +2,6 @@ requests
 pandas
 beautifulsoup4
 selenium
+nicegui
+plotly
+numpy
