@@ -1,0 +1,5 @@
+{
+    "endpoint": "Historical Options",
+    "message": "No data for symbol NVDA on date 2024-08-18. Please specify a valid combination of symbol and trading day.",
+    "data": []
+}
